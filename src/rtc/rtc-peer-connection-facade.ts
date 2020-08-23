@@ -1,45 +1,28 @@
 // tslint:disable:max-file-line-count
-import { ArtichokeApi } from '../artichoke/artichoke-api';
-import { ID } from '../protocol/protocol';
 import { DataChannel, DataChannelMessage } from './data-channel';
 import { LoggerService } from '../logger/logger-service';
-import { WebRTCStats } from './stats/webrtc-stats';
 import { WebRTCStatsCollector } from './stats/webrtc-stats-collector';
-import { NoopCollector } from './stats/noop-collector';
-import { Delayer } from '../utils/delayer';
 import { Queue } from '../utils/queue';
-
-export enum ConnectionStatus {
-  Failed,
-  Connected,
-  Disconnected
-}
+import { WebRTCFunctions } from './stats/callstats.interface';
 
 export class RTCPeerConnectionFacade {
-  public static readonly renegotiationTimeout = 100;
-
-  private statsCollector: WebRTCStatsCollector = new NoopCollector();
-
-  // FIXME Required by the various hacks:
+  // Required to know when to drain ice candidates
   private isRemoteSDPset = false;
-  private dtlsRole: 'active' | 'passive';
+  // Used to know which site should reconnect
+  private isOferrer = false;
 
   constructor(
-    private callId: ID,
-    private peerId: ID,
     private rtcPeerConnection: RTCPeerConnection,
-    private artichokeApi: ArtichokeApi,
-    private onRemoteTrack: (track: MediaStreamTrack) => void,
-    private onStatusChange: (status: ConnectionStatus) => void,
     private candidateQueue: Queue<RTCIceCandidateInit>,
     private logger: LoggerService,
     private dataChannel: DataChannel,
-    private delayer: Delayer,
-    initialMediaTracks: ReadonlyArray<MediaStreamTrack>,
-    webrtcStats: WebRTCStats,
+    private webrtcStatsCollector: WebRTCStatsCollector,
+    private sendCandidate: (candidate: RTCIceCandidate) => void,
+    private sendDescription: (description: RTCSessionDescriptionInit) => void,
+    private onRemoteTrack: (track: MediaStreamTrack) => void,
+    private onStatusChange: (status: RTCIceConnectionState) => void,
+    private degradationPreference?: RTCDegradationPreference,
   ) {
-    this.statsCollector = webrtcStats.createCollector(this.rtcPeerConnection, callId, peerId);
-    initialMediaTracks.forEach(track => this.addTrack(track));
     this.registerRtcEvents();
   }
 
@@ -72,12 +55,7 @@ export class RTCPeerConnectionFacade {
     this.logger.debug(`Received an RTC candidate: ${candidate.candidate}`);
 
     if (this.isRemoteSDPset) {
-      this.rtcPeerConnection.addIceCandidate(new RTCIceCandidate(candidate as RTCIceCandidateInit))
-        .then(_ => this.logger.debug('Candidate successfully added'))
-        .catch((err?: DOMError) => {
-          this.logger.error('Could not add candidate: ', err);
-          this.statsCollector.reportError('addIceCandidate', err);
-        });
+      this.addRTCIceCandidateInit(candidate);
     } else {
       this.candidateQueue.add(candidate);
     }
@@ -104,7 +82,7 @@ export class RTCPeerConnectionFacade {
 
     return this.setRemoteDescription(remoteDescription)
       .catch((err?: DOMError) => {
-        this.statsCollector.reportError('setRemoteDescription', err);
+        this.webrtcStatsCollector.reportError('setRemoteDescription', err);
         throw err;
       })
       .then(_descr => {
@@ -121,12 +99,6 @@ export class RTCPeerConnectionFacade {
   }
 
   public handleRemoteAnswer(remoteDescription: RTCSessionDescriptionInit): Promise<void> {
-    if (!this.dtlsRole && remoteDescription.sdp) {
-      this.logger.debug('Detecting DTLS role based on remote answer');
-      this.dtlsRole = remoteDescription.sdp.includes('a=setup:active') ? 'passive' : 'active';
-      this.logger.debug(`Detected DTLS role: ${this.dtlsRole}`);
-    }
-
     this.logger.debug('Adding remote answer');
 
     return this.setRemoteDescription(remoteDescription)
@@ -140,17 +112,18 @@ export class RTCPeerConnectionFacade {
 
   public offer(options?: RTCOfferOptions): Promise<void> {
     this.logger.debug('Creating an RTC offer.');
+    this.isOferrer = true;
 
     this.dataChannel.createConnection();
 
     return this.rtcPeerConnection.createOffer(options)
       .catch((err?: DOMError) => {
-        this.statsCollector.reportError('createOffer', err);
+        this.webrtcStatsCollector.reportError('createOffer', err);
         throw err;
       })
       .then(offer => this.setLocalDescription(offer))
       .then(offer => {
-        this.artichokeApi.sendDescription(this.callId, this.peerId, offer);
+        this.sendDescription(offer);
         this.logger.debug(`Sent an RTC offer: ${offer.sdp}`);
       })
       .catch(err => {
@@ -167,34 +140,20 @@ export class RTCPeerConnectionFacade {
 
     return this.rtcPeerConnection.createAnswer(options)
       .catch((err?: DOMError) => {
-        this.statsCollector.reportError('createAnswer', err);
+        this.webrtcStatsCollector.reportError('createAnswer', err);
         throw err;
       })
       .then(answer => {
         this.logger.debug('Created an RTC answer');
 
-        if (!this.dtlsRole && answer.sdp) {
-          this.logger.debug('Detecting DTLS role based on created answer');
-          this.dtlsRole = answer.sdp.includes('a=setup:active') ? 'active' : 'passive';
-          this.logger.debug(`Detected DTLS role: ${this.dtlsRole}`);
-        }
-        this.patchSDPAnswer(answer);
-
         return this.setLocalDescription(answer);
       })
       .then(answer => {
-        this.artichokeApi.sendDescription(this.callId, this.peerId, answer);
+        this.sendDescription(answer);
         this.logger.debug(`Sent an RTC answer: ${answer.sdp}`);
 
         return answer;
       });
-  }
-
-  private patchSDPAnswer(answer: RTCSessionDescriptionInit): void {
-    if (this.dtlsRole === 'passive' && answer.sdp && answer.sdp.includes('a=setup:active')) {
-      this.logger.info('DTLS role mismatch detected, patching SDP answer');
-      answer.sdp = answer.sdp.replace(/a=setup:active/g, 'a=setup:passive');
-    }
   }
 
   private setRemoteDescription(remoteDescription: RTCSessionDescriptionInit): Promise<void> {
@@ -206,12 +165,16 @@ export class RTCPeerConnectionFacade {
 
   private drainCandidatesAfterSettingRemoteSDP(): void {
     this.isRemoteSDPset = true;
-    this.candidateQueue.drain().forEach(candidate =>
-      this.rtcPeerConnection.addIceCandidate(new RTCIceCandidate(candidate))
-        .catch((err?: DOMError) => {
-          this.logger.error('Could not add candidate: ', err);
-          this.statsCollector.reportError('addIceCandidate', err);
-        }));
+    this.candidateQueue.drain().forEach(candidate => this.addRTCIceCandidateInit(candidate));
+  }
+
+  private addRTCIceCandidateInit(candidateInit: RTCIceCandidateInit): void {
+    this.rtcPeerConnection.addIceCandidate(new RTCIceCandidate(candidateInit))
+      .then(() => this.logger.debug(`Candidate ${candidateInit} added`))
+      .catch((err?: DOMError) => {
+        this.logger.error('Could not add candidate: ', err);
+        this.reportCallstatsError('addIceCandidate', err);
+      });
   }
 
   private setLocalDescription(localDescription: RTCSessionDescriptionInit): Promise<RTCSessionDescriptionInit> {
@@ -220,21 +183,51 @@ export class RTCPeerConnectionFacade {
     return this.rtcPeerConnection.setLocalDescription(localDescription)
       .then(() => localDescription)
       .catch((err?: DOMError) => {
-        this.statsCollector.reportError('setLocalDescription', err);
+        this.reportCallstatsError('setLocalDescription', err);
         throw err;
       });
   }
 
-  private isEstablished(): boolean {
-    // NOTE 'stable' means no exchange is going on, which encompases 'fresh'
-    // NOTE RTC connections as well as established ones.
-    if (typeof this.rtcPeerConnection.connectionState !== 'undefined') {
-      return this.rtcPeerConnection.connectionState === 'connected'; // Supported only by Safari
-    } else {
-      // FIXME Firefox does not support connectionState: https://bugzilla.mozilla.org/show_bug.cgi?id=1265827
-      return this.rtcPeerConnection.signalingState === 'stable' &&
-        (this.rtcPeerConnection.iceConnectionState === 'connected' ||
-          this.rtcPeerConnection.iceConnectionState === 'completed');
+  private onIceConnectionStateChange(connectionState: RTCIceConnectionState): void {
+    if (connectionState === 'checking' && this.degradationPreference) {
+      this.logger.debug('degradationPreference is enabled, configuring video senders');
+      this.setVideoSendersDegradationPreference(this.degradationPreference);
+    }
+    if (connectionState === 'failed') {
+      this.reportCallstatsError('iceConnectionFailure');
+      if (this.isOferrer) {
+        this.reconnect();
+      }
+    }
+    this.onStatusChange(connectionState);
+  }
+
+  private reconnect(): void {
+    this.logger.info('Reconnecting');
+    this.offer({ iceRestart: true }).then(
+      () => {
+        this.logger.debug('Reconnected');
+        this.registerRtcEvents();
+      },
+      err => this.logger.error('Reconnecting error', err)
+    );
+  }
+
+  /**
+   * Must be called after checking ice connection state,
+   * If not, setParameters will fail because transactionId will be empty
+   */
+  private setVideoSendersDegradationPreference(degradationPreference: RTCDegradationPreference): void {
+    try {
+      this.rtcPeerConnection.getSenders().forEach(sender => {
+        const rtpParams = sender.getParameters();
+        const newRtpParams: RTCRtpParameters = { ...rtpParams, degradationPreference };
+        sender.setParameters(newRtpParams)
+          .then(() => this.logger.debug(`Applied degradationPreference ${degradationPreference} successfully`))
+          .catch(err => this.logger.error(`Setting degradationPreference to ${degradationPreference} failed`, err));
+      });
+    } catch (e) {
+      this.logger.warn('Optimizing video sender failed, check if your browsers supports RTCRtpSender.setParameters', e);
     }
   }
 
@@ -243,7 +236,7 @@ export class RTCPeerConnectionFacade {
     this.rtcPeerConnection.onicecandidate = (event): void => {
       if (event.candidate) {
         this.logger.debug(`Created ICE candidate: ${event.candidate.candidate}`);
-        this.artichokeApi.sendCandidate(this.callId, this.peerId, event.candidate);
+        this.sendCandidate(event.candidate);
         this.logger.debug('Candidate sent successfully');
       } else {
         this.logger.debug('Done gathering ICE candidates.');
@@ -251,7 +244,7 @@ export class RTCPeerConnectionFacade {
     };
 
     this.rtcPeerConnection.ontrack = (event: RTCTrackEvent): void => {
-      const track = event.track;
+      const { track } = event;
       this.logger.info(`Received a remote track ${track.id}`);
 
       return this.onRemoteTrack(event.track);
@@ -260,22 +253,15 @@ export class RTCPeerConnectionFacade {
     this.rtcPeerConnection.onnegotiationneeded = (_event): void => {
       this.logger.debug('Negotiation needed');
       this.printRtcStates();
-      // FIXME Chrome triggers renegotiation on... Initial offer creation...
-      // FIXME Firefox triggers renegotiation when remote offer is received.
-      if (this.isEstablished()) {
-        this.delayer.delayOnce(RTCPeerConnectionFacade.renegotiationTimeout, () => {
-            this.logger.debug('Renegotiating');
-            this.offer().then(
-              () => this.logger.debug('Sending renegotiatin offer'),
-              err => this.logger.error('Renegotiation offer failed', err)
-            );
-          });
-      } else {
-        this.logger.debug('onnegotiationneeded - connection not established - doing nothing');
-      }
+      this.logger.debug('Renegotiating');
+      this.offer().then(
+        () => this.logger.debug('Sending renegotiatin offer'),
+        err => this.logger.error('Renegotiation offer failed', err)
+      );
     };
 
     this.rtcPeerConnection.ondatachannel = (): void => {
+      // Safari is incompatible, but creating data cahnnel on both sides works well.
       this.logger.debug('On DataChannel');
     };
     this.rtcPeerConnection.onicecandidateerror = (ev): void => {
@@ -283,11 +269,20 @@ export class RTCPeerConnectionFacade {
     };
     this.rtcPeerConnection.onconnectionstatechange = (): void => {
       // connectionState is supported only by Safari atm - 23.07.18
-      this.logger.debug(`Connection state change: ${this.rtcPeerConnection.connectionState}`);
+      const connectionState = this.rtcPeerConnection.connectionState;
+      this.logger.debug(`Connection state change: ${connectionState}`);
+
+      if (connectionState === 'failed') {
+        this.reportCallstatsError('iceConnectionFailure');
+        if (this.isOferrer) {
+          this.reconnect();
+        }
+      }
     };
     this.rtcPeerConnection.oniceconnectionstatechange = (ev): void => {
-      this.logger.debug(`ICE connection state change: ${this.rtcPeerConnection.iceConnectionState}`, ev);
-      this.notifyStatusChange(this.rtcPeerConnection.iceConnectionState);
+      const { iceConnectionState } = this.rtcPeerConnection;
+      this.logger.debug(`ICE connection state change: ${iceConnectionState}`, ev);
+      this.onIceConnectionStateChange(iceConnectionState);
     };
     this.rtcPeerConnection.onicegatheringstatechange = (ev): void => {
       this.logger.debug(`ICE gathering state change: ${this.rtcPeerConnection.iceGatheringState}`, ev);
@@ -305,24 +300,13 @@ export class RTCPeerConnectionFacade {
     this.logger.debug(`ICE Gathering state: ${this.rtcPeerConnection.iceGatheringState}`);
   }
 
-  private notifyStatusChange(iceConnectionState: RTCIceConnectionState): void {
-    switch (iceConnectionState) {
-      case 'failed':
-        this.statsCollector.reportError('iceConnectionFailure');
-
-        return this.onStatusChange(ConnectionStatus.Failed);
-      case 'connected':
-        return this.onStatusChange(ConnectionStatus.Connected);
-      case 'closed': // it is end - can not reconnect
-        return this.onStatusChange(ConnectionStatus.Disconnected);
-      case 'disconnected': // but can reconnect
-        return this.onStatusChange(ConnectionStatus.Disconnected);
-      default:
-    }
-  }
-
   private handleFailedConnection(): void {
     this.logger.warn('Connection failed, emitting failed & closing connection');
-    this.onStatusChange(ConnectionStatus.Failed);
+    this.onStatusChange('failed');
+  }
+
+  private reportCallstatsError(webRTCFunction: WebRTCFunctions, err?: DOMError): void {
+    this.logger.debug(`Reporting ${webRTCFunction} error`);
+    this.webrtcStatsCollector.reportError(webRTCFunction, err);
   }
 }

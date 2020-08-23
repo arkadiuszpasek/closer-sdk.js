@@ -1,8 +1,7 @@
 import { VideoHint, AudioHint } from '../rtc/media-track-content-hint';
 
 export interface RTCConfig extends RTCConfiguration {
-    optimizeVideoForFPS?: boolean;
-    reconnectOnFailure?: boolean;
+    degradationPreference?: RTCDegradationPreference; // default = 'balanced'
     videoHint?: VideoHint;
     audioHint?: AudioHint;
 }

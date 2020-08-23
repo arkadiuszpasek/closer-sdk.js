@@ -1,15 +1,14 @@
 import { rtcEvents } from '../protocol/events/rtc-events';
-import { ArtichokeApi } from '../artichoke/artichoke-api';
 import { ID } from '../protocol/protocol';
-import { ConnectionStatus, RTCPeerConnectionFacade } from './rtc-peer-connection-facade';
+import { RTCPeerConnectionFacade } from './rtc-peer-connection-facade';
 import { Observable, Subject } from 'rxjs';
-import { filter } from 'rxjs/operators';
 import { DataChannelMessage, DataChannel } from './data-channel';
 import { LoggerFactory } from '../logger/logger-factory';
 import { LoggerService } from '../logger/logger-service';
 import { WebRTCStats } from './stats/webrtc-stats';
 import { Queue } from '../utils/queue';
-import { Delayer } from '../utils/delayer';
+import { RTCConfig } from '../config/rtc-config';
+import { SignalingClient } from './signaling-client';
 
 export interface RemoteTrack {
   peerId: ID;
@@ -23,7 +22,7 @@ export interface PeerDataChannelMessage {
 
 export interface PeerConnectionStatus {
   peerId: ID;
-  status: ConnectionStatus;
+  state: RTCIceConnectionState;
 }
 
 export class RTCPool {
@@ -37,18 +36,18 @@ export class RTCPool {
 
   constructor(
     public readonly callId: ID,
-    private rtcConfig: RTCConfiguration,
+    private rtcConfig: RTCConfig,
     private loggerFactory: LoggerFactory,
-    private artichokeApi: ArtichokeApi,
+    private signalingClient: SignalingClient,
     private webrtcStats: WebRTCStats
   ) {
 
     this.logger = loggerFactory.create(`RTCPool(${callId})`);
 
     // FIXME - unsubscribe
-    this.descriptionSent$.subscribe(this.listenForDescriptionSent);
+    this.signalingClient.sessionDescription$.subscribe(this.listenForDescriptionSent);
     // FIXME - unsubscribe
-    this.candidateSent$.subscribe(this.listenForCandidateSent);
+    this.signalingClient.iceCandidate$.subscribe(this.listenForCandidateSent);
   }
 
   public get message$(): Observable<PeerDataChannelMessage> {
@@ -126,19 +125,6 @@ export class RTCPool {
     this.getRTCPeerConnectionInstance(msg.sender).addCandidate(msg.candidate);
   }
 
-  private get descriptionSent$(): Observable<rtcEvents.DescriptionSent> {
-    return this.getRtcPoolEvent().pipe(filter(rtcEvents.DescriptionSent.is));
-  }
-
-  private get candidateSent$(): Observable<rtcEvents.CandidateSent> {
-    return this.getRtcPoolEvent().pipe(filter(rtcEvents.CandidateSent.is));
-  }
-
-  private getRtcPoolEvent = (): Observable<rtcEvents.RTCSignallingEvent> =>
-    this.artichokeApi.domainEvent$
-      .pipe(filter(rtcEvents.RTCSignallingEvent.is))
-      .pipe(filter(e => e.callId === this.callId))
-
   private getRTCPeerConnectionInstance = (peerId: ID): RTCPeerConnectionFacade => {
     const maybeRTCPeerConnection = this.peerConnections.get(peerId);
     if (maybeRTCPeerConnection) {
@@ -160,8 +146,8 @@ export class RTCPool {
   private getDataChannelEventHandler = (peerId: ID): (message: DataChannelMessage) => void =>
     (message: DataChannelMessage): void => this.messageEvent.next({ peerId, message })
 
-  private getConnectionStatusEventHandler = (peerId: ID): (status: ConnectionStatus) => void =>
-    (status: ConnectionStatus): void => this.connectionStatusEvent.next({ peerId, status })
+  private getConnectionStatusEventHandler = (peerId: ID): (state: RTCIceConnectionState) => void =>
+    (state: RTCIceConnectionState): void => this.connectionStatusEvent.next({ peerId, state })
 
   private createRTCConnectionFacade(peerId: ID): RTCPeerConnectionFacade {
     this.logger.debug(`Creating new RTCConnection for peerId: ${peerId}`);
@@ -176,17 +162,21 @@ export class RTCPool {
       new Queue<DataChannelMessage>(this.loggerFactory.create('Queue<DataChannelMessage>'))
     );
 
-    return new RTCPeerConnectionFacade(
-      this.callId, peerId, rtcPeerConnection,
-      this.artichokeApi,
-      this.getTrackEventHandler(peerId),
-      this.getConnectionStatusEventHandler(peerId),
+    const rtcPeerConnectionFacade = new RTCPeerConnectionFacade(
+      rtcPeerConnection,
       new Queue<RTCIceCandidateInit>(peerCandidateQueueLogger),
       this.loggerFactory.create(`RTCPeerConnectionFacade Call(${this.callId}) Peer(${peerId})`),
       dataChannel,
-      new Delayer(),
-      this.tracks,
-      this.webrtcStats
+      this.webrtcStats.createCollector(rtcPeerConnection, this.callId, peerId),
+      (candidate: RTCIceCandidate) => this.signalingClient.sendIceCandidate(peerId, candidate),
+      (sdp: RTCSessionDescriptionInit) => this.signalingClient.sendSessionDescription(peerId, sdp),
+      this.getTrackEventHandler(peerId),
+      this.getConnectionStatusEventHandler(peerId),
+      this.rtcConfig.degradationPreference,
     );
+
+    this.tracks.forEach(track => rtcPeerConnectionFacade.addTrack(track));
+
+    return rtcPeerConnectionFacade;
   }
 }
